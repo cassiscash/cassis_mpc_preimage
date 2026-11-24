@@ -1,13 +1,13 @@
-//! Boolean circuit for a batch of `SHA256(r_A ^ r_B)` over 32-byte shares.
+//! Boolean circuit for `SHA256(a ^ b)` over two 32-byte inputs.
 //!
 //! The builder folds constants, so the fixed padding words, the IV and the
 //! round constants don't turn into garbled gates.
 
-use polytune::garble_lang::circuit::{Circuit, Gate};
+use mpz_circuits::{Circuit, CircuitBuilder, Feed, Node};
 
 use crate::SHARE_LEN;
 
-const SHARE_BITS: usize = SHARE_LEN * 8;
+pub(crate) const SHARE_BITS: usize = SHARE_LEN * 8;
 
 const IV: [u32; 8] = [
     0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19,
@@ -24,30 +24,22 @@ const K: [u32; 64] = [
     0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
 ];
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy)]
 enum Bit {
     Const(bool),
-    Wire(usize),
+    Wire(Node<Feed>),
 }
 
 /// A 32-bit word, least significant bit first.
 type Word = [Bit; 32];
 
-struct Builder {
-    num_inputs: usize,
-    gates: Vec<Gate>,
-}
+struct Builder(CircuitBuilder);
 
 impl Builder {
-    fn push(&mut self, gate: Gate) -> Bit {
-        self.gates.push(gate);
-        Bit::Wire(self.num_inputs + self.gates.len() - 1)
-    }
-
     fn not(&mut self, a: Bit) -> Bit {
         match a {
             Bit::Const(x) => Bit::Const(!x),
-            Bit::Wire(a) => self.push(Gate::Not(a)),
+            Bit::Wire(a) => Bit::Wire(self.0.add_inv_gate(a)),
         }
     }
 
@@ -57,7 +49,7 @@ impl Builder {
             (Bit::Const(false), w) | (w, Bit::Const(false)) => w,
             (Bit::Const(true), w) | (w, Bit::Const(true)) => self.not(w),
             (Bit::Wire(a), Bit::Wire(b)) if a == b => Bit::Const(false),
-            (Bit::Wire(a), Bit::Wire(b)) => self.push(Gate::Xor(a, b)),
+            (Bit::Wire(a), Bit::Wire(b)) => Bit::Wire(self.0.add_xor_gate(a, b)),
         }
     }
 
@@ -67,7 +59,7 @@ impl Builder {
             (Bit::Const(false), _) | (_, Bit::Const(false)) => Bit::Const(false),
             (Bit::Const(true), w) | (w, Bit::Const(true)) => w,
             (Bit::Wire(a), Bit::Wire(b)) if a == b => Bit::Wire(a),
-            (Bit::Wire(a), Bit::Wire(b)) => self.push(Gate::And(a, b)),
+            (Bit::Wire(a), Bit::Wire(b)) => Bit::Wire(self.0.add_and_gate(a, b)),
         }
     }
 
@@ -180,48 +172,45 @@ fn shr(w: &Word, n: usize) -> Word {
     })
 }
 
-fn output_wire(bit: Bit) -> usize {
-    match bit {
-        Bit::Wire(w) => w,
-        Bit::Const(_) => unreachable!("every hash bit depends on the inputs"),
-    }
+/// Circuit computing `SHA256(a ^ b)`.
+///
+/// Inputs are the 256 bits of `a`, then the 256 bits of `b`, each MSB-first.
+/// The output is the 256-bit hash, MSB-first.
+pub(crate) fn sha256_xor() -> Circuit {
+    build(|b, x, y| b.xor(x, y))
 }
 
-/// Circuit computing `n` hashes `SHA256(r_A[i] ^ r_B[i])`.
-///
-/// Party 0 (A) inputs `n * 256` bits, then party 1 (B) inputs `n * 256` bits,
-/// each share MSB-first. The output is `n * 256` bits of hashes, MSB-first.
-pub fn sha256_batch(n: usize) -> Circuit {
-    let mut b = Builder {
-        num_inputs: 2 * n * SHARE_BITS,
-        gates: Vec::new(),
-    };
-    let mut outputs = Vec::with_capacity(n * 256);
+/// A cheating garbler's circuit: `SHA256(a)`, ignoring `b`, so the garbler
+/// would know the preimage. It has the same AND gates as [`sha256_xor`].
+#[cfg(test)]
+pub(crate) fn sha256_of_a() -> Circuit {
+    build(|_, x, _| x)
+}
 
-    for i in 0..n {
-        // 32-byte message, then 0x80, zeros, and the bit length (256).
-        let mut block = [[Bit::Const(false); 32]; 16];
-        for pos in 0..SHARE_BITS {
-            let a = Bit::Wire(i * SHARE_BITS + pos);
-            let r_b = Bit::Wire((n + i) * SHARE_BITS + pos);
-            // MSB-first input bits into LSB-first words.
-            block[pos / 32][31 - pos % 32] = b.xor(a, r_b);
-        }
-        block[8] = const_word(0x8000_0000);
-        block[15] = const_word(SHARE_BITS as u32);
+fn build(mix: impl Fn(&mut Builder, Bit, Bit) -> Bit) -> Circuit {
+    let mut b = Builder(CircuitBuilder::new());
+    let a_in: Vec<_> = (0..SHARE_BITS).map(|_| b.0.add_input()).collect();
+    let b_in: Vec<_> = (0..SHARE_BITS).map(|_| b.0.add_input()).collect();
 
-        for word in b.sha256_block(&block) {
-            for bit in (0..32).rev() {
-                outputs.push(output_wire(word[bit]));
-            }
+    // 32-byte message, then 0x80, zeros, and the bit length (256).
+    let mut block = [[Bit::Const(false); 32]; 16];
+    for pos in 0..SHARE_BITS {
+        // MSB-first input bits into LSB-first words.
+        block[pos / 32][31 - pos % 32] = mix(&mut b, Bit::Wire(a_in[pos]), Bit::Wire(b_in[pos]));
+    }
+    block[8] = const_word(0x8000_0000);
+    block[15] = const_word(SHARE_BITS as u32);
+
+    for word in b.sha256_block(&block) {
+        for bit in word.into_iter().rev() {
+            let Bit::Wire(node) = bit else {
+                unreachable!("every hash bit depends on the inputs")
+            };
+            b.0.add_output(node);
         }
     }
 
-    Circuit {
-        input_gates: vec![n * SHARE_BITS, n * SHARE_BITS],
-        gates: b.gates,
-        output_gates: outputs,
-    }
+    b.0.build().expect("sha256 circuit is valid")
 }
 
 #[cfg(test)]
@@ -232,21 +221,17 @@ mod tests {
 
     #[test]
     fn plaintext_eval_matches_sha256() {
-        let n = 3;
-        let circuit = sha256_batch(n);
-        circuit.validate().expect("valid circuit");
+        let circuit = sha256_xor();
+        let a = [0x11u8; 32];
+        let b: [u8; 32] = std::array::from_fn(|i| i as u8);
 
-        let a: Vec<[u8; 32]> = (0..n).map(|i| [i as u8 + 1; 32]).collect();
-        let b: Vec<[u8; 32]> = (0..n).map(|i| [0xa5 ^ i as u8; 32]).collect();
-        let out = circuit.eval(&[
-            a.iter().flat_map(|s| bytes_to_bits(s)).collect(),
-            b.iter().flat_map(|s| bytes_to_bits(s)).collect(),
-        ]);
+        let inputs: Vec<bool> = bytes_to_bits(&a)
+            .into_iter()
+            .chain(bytes_to_bits(&b))
+            .collect();
+        let out = circuit.evaluate(inputs).unwrap();
 
-        for i in 0..n {
-            let x: Vec<u8> = a[i].iter().zip(&b[i]).map(|(a, b)| a ^ b).collect();
-            let got = bits_to_bytes(&out[i * 256..(i + 1) * 256]);
-            assert_eq!(got.as_slice(), Sha256::digest(&x).as_slice());
-        }
+        let x: Vec<u8> = a.iter().zip(&b).map(|(a, b)| a ^ b).collect();
+        assert_eq!(bits_to_bytes(&out), Sha256::digest(&x).as_slice());
     }
 }
