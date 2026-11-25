@@ -16,7 +16,6 @@ rand = "0.10"
 serde = { version = "1", features = ["derive"] }
 serio = "0.2"
 sha2 = "0.10"
-spake2 = "0.4"
 
 [dev-dependencies]
 iroh = "1.5.0"

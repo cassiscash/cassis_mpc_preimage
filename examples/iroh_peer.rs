@@ -47,7 +47,9 @@ fn report(role: Role, progress: Progress<'_>) {
             println!("  evaluated circuit #{index}: {}", hex(hash))
         }
         Progress::Checking => {
-            println!("check: comparing both runs' output labels in a SPAKE2 equality test")
+            println!(
+                "check: comparing both runs' output labels in a commit-and-reveal equality test"
+            )
         }
         Progress::Verified => {
             println!("check passed: both runs used the same shares and the honest circuit")
