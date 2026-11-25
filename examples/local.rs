@@ -1,3 +1,7 @@
+//! Benchmark: runs both parties in one process over an in-memory stream.
+//!
+//!     cargo run --release --example local -- <batch size>
+
 use std::{
     io,
     pin::Pin,
@@ -11,7 +15,6 @@ use std::{
 
 use futures::{AsyncRead, AsyncWrite};
 use mpc_preimage::{Role, generate_batch, open, random_shares};
-use mpz_common::Context;
 use tokio_util::compat::TokioAsyncReadCompatExt;
 
 /// Counts the bytes written through an IO stream.
@@ -69,21 +72,21 @@ async fn main() {
 
     let (io_a, io_b) = tokio::io::duplex(1 << 20);
     let (sent_a, sent_b) = (Arc::default(), Arc::default());
-    let mut ctx_a = Context::new_single_threaded(Counted {
+    let io_a = Counted {
         inner: io_a.compat(),
         sent: Arc::clone(&sent_a),
-    });
-    let mut ctx_b = Context::new_single_threaded(Counted {
+    };
+    let io_b = Counted {
         inner: io_b.compat(),
         sent: Arc::clone(&sent_b),
-    });
+    };
 
     let start = Instant::now();
     let b_task = {
         let b_shares = b_shares.clone();
-        tokio::spawn(async move { generate_batch(&mut ctx_b, Role::B, &b_shares).await })
+        tokio::spawn(async move { generate_batch(io_b, Role::B, &b_shares).await })
     };
-    let hashes = generate_batch(&mut ctx_a, Role::A, &a_shares)
+    let hashes = generate_batch(io_a, Role::A, &a_shares)
         .await
         .expect("party A");
     let hashes_b = b_task.await.unwrap().expect("party B");

@@ -18,11 +18,16 @@
 //! Many hashes are produced in one batch, so they can be pregenerated and
 //! consumed later. To release a preimage, both parties reveal their shares and
 //! anyone can check them with [`open`].
+//!
+//! Each program runs one party. It brings its own transport: any reliable,
+//! ordered byte stream to the other party (TCP, TLS, a QUIC stream, ...) passed
+//! to [`generate_batch`]. The transport should authenticate the peer.
 
 mod circuit;
 mod equality;
 mod execution;
 
+use futures::{AsyncRead, AsyncWrite};
 use mpz_circuits::Circuit;
 use mpz_common::Context;
 use mpz_garble_core::{Delta, Mac};
@@ -32,16 +37,20 @@ use mpz_ot::{
     kos::{self, ReceiverConfig, SenderConfig},
 };
 use rand::RngExt;
+use serio::{SinkExt, stream::IoStreamExt};
 use sha2::{Digest, Sha256};
 
 pub const SHARE_LEN: usize = 32;
+
+/// Sent in the handshake; peers with a different version refuse to run.
+const PROTOCOL_VERSION: u32 = 1;
 
 pub type Share = [u8; SHARE_LEN];
 pub type Hash = [u8; 32];
 pub type Preimage = [u8; SHARE_LEN];
 pub type Error = Box<dyn std::error::Error + Send + Sync>;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Role {
     /// Garbles first.
     A,
@@ -63,16 +72,84 @@ pub fn random_shares(n: usize) -> Vec<Share> {
     (0..n).map(|_| rng.random()).collect()
 }
 
-/// Runs the dual-execution 2PC for a batch of shares. Both parties must call
-/// this with batches of the same length; hash `i` belongs to share `i` on
-/// both sides. Returns an error, and no hashes, if the check fails.
-pub async fn generate_batch(
-    ctx: &mut Context,
+/// A step of [`generate_batch_with_progress`], reported as it happens.
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum Progress<'a> {
+    /// Both peers agreed on the protocol version, their roles and the batch
+    /// size.
+    Handshake { batch_size: usize },
+    /// One of the two runs started. In run 1, A garbles and B evaluates; in
+    /// run 2 it's the other way around.
+    RunStarted { run: u8, garbler: Role },
+    /// Oblivious transfer gave the evaluator the input labels for the bits of
+    /// its shares, without the garbler learning those bits.
+    InputLabelsTransferred { bits: usize },
+    /// We garbled circuit `index` and sent it.
+    Garbled { index: usize, bytes: usize },
+    /// We evaluated circuit `index` and decoded its hash.
+    Evaluated { index: usize, hash: &'a Hash },
+    /// The secure equality test is about to compare the output labels of both
+    /// runs.
+    Checking,
+    /// The check passed: both runs computed the same, correct hashes.
+    Verified,
+}
+
+/// Runs this party's side of the dual-execution 2PC for a batch of shares,
+/// talking to the other party over `io`.
+///
+/// Both parties must use the same batch size and opposite roles; hash `i`
+/// belongs to share `i` on both sides. Returns an error, and no hashes, if the
+/// other party cheated or the connection failed. Throw away the shares of a
+/// failed batch and don't retry with them.
+pub async fn generate_batch<T>(io: T, role: Role, shares: &[Share]) -> Result<Vec<Hash>, Error>
+where
+    T: AsyncRead + AsyncWrite + Send + Sync + Unpin + 'static,
+{
+    generate_batch_with_progress(io, role, shares, |_| {}).await
+}
+
+/// [`generate_batch`], calling `progress` after each step.
+pub async fn generate_batch_with_progress<T>(
+    io: T,
     role: Role,
     shares: &[Share],
-) -> Result<Vec<Hash>, Error> {
+    mut progress: impl FnMut(Progress<'_>) + Send,
+) -> Result<Vec<Hash>, Error>
+where
+    T: AsyncRead + AsyncWrite + Send + Sync + Unpin + 'static,
+{
+    let mut ctx = Context::new_single_threaded(io);
     let circuit = circuit::sha256_xor();
-    dual_execution(ctx, role, shares, (shares, &circuit), &circuit).await
+    dual_execution(
+        &mut ctx,
+        role,
+        shares,
+        (shares, &circuit),
+        &circuit,
+        &mut progress,
+    )
+    .await
+}
+
+/// Checks that the peer runs the same protocol version, plays the other role
+/// and uses the same batch size.
+async fn handshake(ctx: &mut Context, role: Role, batch_size: usize) -> Result<(), Error> {
+    ctx.io_mut()
+        .send((PROTOCOL_VERSION, role, batch_size as u64))
+        .await?;
+    let (version, peer_role, peer_size): (u32, Role, u64) = ctx.io_mut().expect_next().await?;
+    if version != PROTOCOL_VERSION {
+        return Err(format!("handshake: peer runs protocol version {version}").into());
+    }
+    if peer_role != role.other() {
+        return Err(format!("handshake: both parties chose role {role:?}").into());
+    }
+    if peer_size != batch_size as u64 {
+        return Err(format!("handshake: batch size {batch_size}, but peer has {peer_size}").into());
+    }
+    Ok(())
 }
 
 /// `garbling` is what this party garbles with. Only tests that simulate a
@@ -83,7 +160,13 @@ async fn dual_execution(
     shares: &[Share],
     garbling: (&[Share], &Circuit),
     circuit: &Circuit,
+    progress: &mut (dyn FnMut(Progress<'_>) + Send),
 ) -> Result<Vec<Hash>, Error> {
+    handshake(ctx, role, shares.len()).await?;
+    progress(Progress::Handshake {
+        batch_size: shares.len(),
+    });
+
     let (garble_shares, garble_circuit) = garbling;
     let delta = Delta::random(&mut rand::rng());
     let mut cot_sender = DerandCOTSender::new(kos::Sender::new(
@@ -98,17 +181,47 @@ async fn dual_execution(
 
     let (keys, (macs, hashes)) = match role {
         Role::A => {
-            let keys =
-                execution::garble(ctx, &mut cot_sender, delta, garble_shares, garble_circuit)
-                    .await?;
-            let eval = execution::evaluate(ctx, &mut cot_receiver, shares, circuit).await?;
+            progress(Progress::RunStarted {
+                run: 1,
+                garbler: Role::A,
+            });
+            let keys = execution::garble(
+                ctx,
+                &mut cot_sender,
+                delta,
+                garble_shares,
+                garble_circuit,
+                progress,
+            )
+            .await?;
+            progress(Progress::RunStarted {
+                run: 2,
+                garbler: Role::B,
+            });
+            let eval =
+                execution::evaluate(ctx, &mut cot_receiver, shares, circuit, progress).await?;
             (keys, eval)
         }
         Role::B => {
-            let eval = execution::evaluate(ctx, &mut cot_receiver, shares, circuit).await?;
-            let keys =
-                execution::garble(ctx, &mut cot_sender, delta, garble_shares, garble_circuit)
-                    .await?;
+            progress(Progress::RunStarted {
+                run: 1,
+                garbler: Role::A,
+            });
+            let eval =
+                execution::evaluate(ctx, &mut cot_receiver, shares, circuit, progress).await?;
+            progress(Progress::RunStarted {
+                run: 2,
+                garbler: Role::B,
+            });
+            let keys = execution::garble(
+                ctx,
+                &mut cot_sender,
+                delta,
+                garble_shares,
+                garble_circuit,
+                progress,
+            )
+            .await?;
             (keys, eval)
         }
     };
@@ -135,9 +248,11 @@ async fn dual_execution(
         .fold(Sha256::new(), |h, mac| h.chain_update(mac.as_bytes()))
         .finalize();
 
+    progress(Progress::Checking);
     if !equality::equal(ctx, role, &check.into()).await? {
         return Err("dual-execution check failed: the other party cheated".into());
     }
+    progress(Progress::Verified);
 
     Ok(hashes)
 }
@@ -165,13 +280,21 @@ pub(crate) fn bits_to_bytes(bits: &[bool]) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokio_util::compat::TokioAsyncReadCompatExt;
+    use tokio_util::compat::{Compat, TokioAsyncReadCompatExt};
+
+    fn streams() -> (
+        Compat<tokio::io::DuplexStream>,
+        Compat<tokio::io::DuplexStream>,
+    ) {
+        let (io_a, io_b) = tokio::io::duplex(1 << 20);
+        (io_a.compat(), io_b.compat())
+    }
 
     fn contexts() -> (Context, Context) {
-        let (io_a, io_b) = tokio::io::duplex(1 << 20);
+        let (io_a, io_b) = streams();
         (
-            Context::new_single_threaded(io_a.compat()),
-            Context::new_single_threaded(io_b.compat()),
+            Context::new_single_threaded(io_a),
+            Context::new_single_threaded(io_b),
         )
     }
 
@@ -180,11 +303,11 @@ mod tests {
         let n = 3;
         let a_shares = random_shares(n);
         let b_shares = random_shares(n);
-        let (mut ctx_a, mut ctx_b) = contexts();
+        let (io_a, io_b) = streams();
 
         let (hashes_a, hashes_b) = tokio::join!(
-            generate_batch(&mut ctx_a, Role::A, &a_shares),
-            generate_batch(&mut ctx_b, Role::B, &b_shares),
+            generate_batch(io_a, Role::A, &a_shares),
+            generate_batch(io_b, Role::B, &b_shares),
         );
         let (hashes_a, hashes_b) = (hashes_a.unwrap(), hashes_b.unwrap());
 
@@ -206,12 +329,21 @@ mod tests {
         a_shares: &[Share],
         b_shares: &[Share],
     ) -> (Result<Vec<Hash>, Error>, Result<Vec<Hash>, Error>) {
-        let (mut ctx_a, mut ctx_b) = contexts();
+        let (io_a, io_b) = streams();
+        let mut ctx_a = Context::new_single_threaded(io_a);
         let honest = circuit::sha256_xor();
+        let mut no_progress = |_: Progress<'_>| {};
         tokio::time::timeout(std::time::Duration::from_secs(60), async {
             tokio::join!(
-                dual_execution(&mut ctx_a, Role::A, a_shares, cheat, &honest),
-                generate_batch(&mut ctx_b, Role::B, b_shares),
+                dual_execution(
+                    &mut ctx_a,
+                    Role::A,
+                    a_shares,
+                    cheat,
+                    &honest,
+                    &mut no_progress
+                ),
+                generate_batch(io_b, Role::B, b_shares),
             )
         })
         .await
@@ -237,6 +369,22 @@ mod tests {
         let (a, b) = run_with_cheating_a((&other_shares, &honest), &a_shares, &b_shares).await;
         assert_check_failed(a);
         assert_check_failed(b);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn handshake_rejects_mismatches() {
+        for (role_b, n_b) in [(Role::A, 2), (Role::B, 3)] {
+            let (io_a, io_b) = streams();
+            let (a_shares, b_shares) = (random_shares(2), random_shares(n_b));
+            let (a, b) = tokio::join!(
+                generate_batch(io_a, Role::A, &a_shares),
+                generate_batch(io_b, role_b, &b_shares),
+            );
+            for result in [a, b] {
+                let err = result.expect_err("mismatch must be rejected");
+                assert!(err.to_string().starts_with("handshake"), "{err}");
+            }
+        }
     }
 
     #[tokio::test(flavor = "multi_thread")]

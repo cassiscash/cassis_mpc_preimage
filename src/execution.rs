@@ -9,7 +9,7 @@ use mpz_ot::cot::{COTReceiver, COTSender};
 use rand::RngExt;
 use serio::{SinkExt, stream::IoStreamExt};
 
-use crate::{Error, Hash, Share, bits_to_bytes, bytes_to_bits, circuit::SHARE_BITS};
+use crate::{Error, Hash, Progress, Share, bits_to_bytes, bytes_to_bits, circuit::SHARE_BITS};
 
 /// Garbler's message for one hash: labels for its own share, the garbled
 /// gates, and the decoding bits of the output wires.
@@ -23,6 +23,7 @@ pub(crate) async fn garble<C>(
     delta: Delta,
     shares: &[Share],
     circuit: &Circuit,
+    progress: &mut (dyn FnMut(Progress<'_>) + Send),
 ) -> Result<Vec<Vec<Key>>, Error>
 where
     C: COTSender<Block> + Flush + Send,
@@ -43,6 +44,9 @@ where
     let mut sent = cot.queue_send_cot(Key::as_blocks(&ev_keys))?;
     cot.flush(ctx).await?;
     sent.try_recv()?.ok_or("COT was not sent after flush")?;
+    progress(Progress::InputLabelsTransferred {
+        bits: n * SHARE_BITS,
+    });
 
     let mut gb = Garbler::default();
     let mut outputs = Vec::with_capacity(n);
@@ -62,8 +66,10 @@ where
         let keys = gates.finish()?.outputs;
         let decoding: Vec<bool> = keys.iter().map(Key::pointer).collect();
 
+        let bytes = batches.len() * size_of::<EncryptedGateBatch>();
         let msg: GarbledHash = (own_macs, batches, decoding);
         ctx.io_mut().send(msg).await?;
+        progress(Progress::Garbled { index: i, bytes });
         outputs.push(keys);
     }
 
@@ -77,6 +83,7 @@ pub(crate) async fn evaluate<C>(
     cot: &mut C,
     shares: &[Share],
     circuit: &Circuit,
+    progress: &mut (dyn FnMut(Progress<'_>) + Send),
 ) -> Result<(Vec<Vec<Mac>>, Vec<Hash>), Error>
 where
     C: COTReceiver<bool, Block> + Flush + Send,
@@ -95,6 +102,9 @@ where
             .ok_or("COT output was not ready after flush")?
             .msgs,
     );
+    progress(Progress::InputLabelsTransferred {
+        bits: n * SHARE_BITS,
+    });
 
     let mut ev = Evaluator::default();
     let mut macs = Vec::with_capacity(n);
@@ -127,7 +137,12 @@ where
             .zip(&decoding)
             .map(|(mac, d)| mac.pointer() ^ d)
             .collect();
-        hashes.push(bits_to_bytes(&bits).try_into().expect("256 output bits"));
+        let hash: Hash = bits_to_bytes(&bits).try_into().expect("256 output bits");
+        progress(Progress::Evaluated {
+            index: i,
+            hash: &hash,
+        });
+        hashes.push(hash);
         macs.push(out);
     }
 

@@ -5,7 +5,6 @@ edition = "2024"
 
 [dependencies]
 futures = "0.3.34"
-itybity = "0.3.3"
 mpz-circuits = { git = "https://github.com/privacy-scaling-explorations/mpz", rev = "6a1864d0b4425bfc81abdec42ec4b3f5a3ffced2", version = "0.1.0-beta.1" }
 mpz-common = { git = "https://github.com/privacy-scaling-explorations/mpz", rev = "6a1864d0b4425bfc81abdec42ec4b3f5a3ffced2", version = "0.1.0-beta.1" }
 mpz-core = { git = "https://github.com/privacy-scaling-explorations/mpz", rev = "6a1864d0b4425bfc81abdec42ec4b3f5a3ffced2", version = "0.1.0-beta.1" }
@@ -13,11 +12,12 @@ mpz-garble-core = { git = "https://github.com/privacy-scaling-explorations/mpz",
 mpz-memory-core = { git = "https://github.com/privacy-scaling-explorations/mpz", rev = "6a1864d0b4425bfc81abdec42ec4b3f5a3ffced2", version = "0.1.0-beta.1" }
 mpz-ot = { git = "https://github.com/privacy-scaling-explorations/mpz", rev = "6a1864d0b4425bfc81abdec42ec4b3f5a3ffced2", version = "0.1.0-beta.1" }
 rand = "0.10"
+serde = { version = "1", features = ["derive"] }
 serio = "0.2"
 sha2 = "0.10"
 spake2 = "0.4"
-tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "io-util"] }
-tokio-util = { version = "0.7.20", features = ["compat"] }
 
 [dev-dependencies]
-tokio = { version = "1.54.1", features = ["time"] }
+iroh = "1.5.0"
+tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "io-util", "time"] }
+tokio-util = { version = "0.7.20", features = ["compat"] }
